@@ -8,8 +8,12 @@
 React (JSX) and Tailwind from a photo, with no trained model involved.
 This is the baseline any future model has to beat.
 
-**Next: dataset sourcing** — pull a Rico subset and build the annotation
-pipeline for a learned component detector.
+**Dataset sourcing: blocked.** Rico is downloaded (14G in the HF cache) and
+`data/build_dataset.py` converts it to COCO annotations, but the HuggingFace
+config's view hierarchies are flattened lossily — leaf widgets are dropped,
+leaving ~1.7 boxes per screen with no text, input or image classes. Not
+enough to train a detector. Unblocking it means sourcing Rico's original
+JSON hierarchies instead of the HuggingFace config.
 
 ## How it works today
 
