@@ -1,0 +1,21 @@
+# Environments
+venv/
+.venv/
+
+# Python
+__pycache__/
+*.pyc
+
+# Datasets (large, regenerable)
+data/rico/raw/*
+!data/rico/raw/.gitkeep
+data/sketches/raw/*
+!data/sketches/raw/.gitkeep
+
+# Model weights
+*.pth
+*.pt
+
+# Tooling
+.ipynb_checkpoints/
+.gradio/
