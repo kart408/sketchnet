@@ -1,9 +1,16 @@
-torch>=2.0
-torchvision>=0.15
+# App (heuristic pipeline) — install into .venv
+gradio
+opencv-python
+pytesseract
 pillow
 numpy
-matplotlib
+
+# Dataset sourcing
+datasets
+
+# Training (Rico detector — not yet implemented)
+torch>=2.0
+torchvision>=0.15
 pycocotools
 torchmetrics
-streamlit
-opencv-python
+matplotlib

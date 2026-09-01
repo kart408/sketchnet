@@ -1,8 +1,41 @@
-import gradio as gr
+import html as html_lib
+
 import cv2
+import gradio as gr
 import numpy as np
 from PIL import Image
 import pytesseract
+
+
+# Boxes whose top edges fall within this many pixels are treated as one row.
+ROW_TOLERANCE = 25
+
+# Contours smaller than this are noise, not UI shapes.
+MIN_SHAPE_AREA = 500
+
+
+# ==========================
+# PREPROCESSING
+# ==========================
+
+def to_rgb_and_gray(image):
+    """Normalise any PIL input (L / RGB / RGBA) to an RGB view and a grayscale one."""
+
+    img = np.array(image)
+
+    if img.ndim == 2:
+        rgb = cv2.cvtColor(img, cv2.COLOR_GRAY2RGB)
+        gray = img
+
+    elif img.shape[2] == 4:
+        rgb = cv2.cvtColor(img, cv2.COLOR_RGBA2RGB)
+        gray = cv2.cvtColor(img, cv2.COLOR_RGBA2GRAY)
+
+    else:
+        rgb = img
+        gray = cv2.cvtColor(img, cv2.COLOR_RGB2GRAY)
+
+    return rgb, gray
 
 
 def is_duplicate(box, existing_boxes):
@@ -19,6 +52,10 @@ def is_duplicate(box, existing_boxes):
 
     return False
 
+
+# ==========================
+# CLASSIFICATION
+# ==========================
 
 def classify_shape(w, h):
 
@@ -39,8 +76,7 @@ def classify_shape(w, h):
     return "unknown"
 
 
-
-def classify_component(text):
+def classify_text(text):
 
     text_upper = text.upper()
 
@@ -60,41 +96,246 @@ def classify_component(text):
     return "text"
 
 
-def sketch_to_html(image):
+# ==========================
+# COMPONENT ASSEMBLY
+# ==========================
 
-    img = np.array(image)
-    display_img = img.copy()
+def contains(shape, item):
+    """True if the centre of an OCR word sits inside a shape's box."""
 
-    gray = cv2.cvtColor(
-        img,
-        cv2.COLOR_RGB2GRAY
+    cx = item["x"] + item["w"] / 2
+    cy = item["y"] + item["h"] / 2
+
+    return (
+        shape["x"] <= cx <= shape["x"] + shape["w"]
+        and shape["y"] <= cy <= shape["y"] + shape["h"]
     )
 
-    gray = cv2.threshold(
-        gray,
-        150,
-        255,
-        cv2.THRESH_BINARY
-    )[1]
 
-    blurred = cv2.GaussianBlur(
-        gray,
-        (5, 5),
-        0
+def merge_text_into_shapes(words, shapes):
+    """Fold each OCR word into the shape that encloses it.
+
+    A word inside a box labels that box (and can refine its type — a box
+    holding "EMAIL" is an email input, not a generic one). A word with no
+    enclosing box becomes a standalone component of its own.
+    """
+
+    components = [dict(shape, text="") for shape in shapes]
+
+    for word in words:
+
+        enclosing = [s for s in components if contains(s, word)]
+
+        # Innermost container wins: a word inside a button inside a card
+        # labels the button, not the card.
+        host = min(
+            enclosing,
+            key=lambda s: s["w"] * s["h"],
+            default=None
+        )
+
+        if host is None:
+            components.append(
+                dict(word, type=classify_text(word["text"]))
+            )
+            continue
+
+        host["text"] = f"{host['text']} {word['text']}".strip()
+
+        refined = classify_text(word["text"])
+
+        if refined != "text":
+            host["type"] = refined
+
+    return components
+
+
+def sort_by_layout(components):
+    """Reading order: group into rows by vertical position, then left to right."""
+
+    rows = []
+
+    for comp in sorted(components, key=lambda c: c["y"]):
+
+        if rows and abs(comp["y"] - rows[-1][0]["y"]) <= ROW_TOLERANCE:
+            rows[-1].append(comp)
+
+        else:
+            rows.append([comp])
+
+    ordered = []
+
+    for row in rows:
+        ordered.extend(sorted(row, key=lambda c: c["x"]))
+
+    return ordered
+
+
+# ==========================
+# RENDERERS
+# ==========================
+
+def label_for(comp, fallback):
+    return comp["text"].strip() or fallback
+
+
+def render_html(components):
+
+    parts = [
+        '<div style="max-width:400px;margin:auto;'
+        'padding:20px;font-family:Arial;">'
+    ]
+
+    for comp in components:
+
+        kind = comp["type"]
+        text = html_lib.escape(label_for(comp, ""))
+
+        if kind == "text":
+            parts.append(f"  <p>{text}</p>")
+
+        elif kind in ("email", "password", "input"):
+            field = "text" if kind == "input" else kind
+            placeholder = html_lib.escape(
+                label_for(comp, field.capitalize())
+            )
+            parts.append(
+                f'  <input type="{field}" placeholder="{placeholder}" '
+                'style="width:100%;padding:12px;margin-bottom:15px;">'
+            )
+
+        elif kind == "button":
+            parts.append(
+                '  <button style="width:100%;padding:12px;'
+                f'margin-bottom:15px;">{html_lib.escape(label_for(comp, "Button"))}</button>'
+            )
+
+        elif kind == "navbar":
+            parts.append(
+                '  <nav style="background:#1976d2;color:white;'
+                f'padding:15px;margin-bottom:20px;">{html_lib.escape(label_for(comp, "Navbar"))}</nav>'
+            )
+
+        elif kind == "card":
+            parts.append(
+                '  <div style="border:1px solid #ccc;padding:20px;'
+                'margin-bottom:15px;border-radius:8px;">'
+                f'{html_lib.escape(label_for(comp, "Card"))}</div>'
+            )
+
+    parts.append("</div>")
+
+    return "\n".join(parts)
+
+
+def render_tailwind(components):
+
+    parts = ['<div class="max-w-md mx-auto p-6">']
+
+    for comp in components:
+
+        kind = comp["type"]
+        text = html_lib.escape(label_for(comp, ""))
+
+        if kind == "text":
+            parts.append(f'  <p class="mb-3">{text}</p>')
+
+        elif kind in ("email", "password", "input"):
+            field = "text" if kind == "input" else kind
+            placeholder = html_lib.escape(
+                label_for(comp, field.capitalize())
+            )
+            parts.append(
+                f'  <input type="{field}" class="w-full border p-2 mb-4" '
+                f'placeholder="{placeholder}" />'
+            )
+
+        elif kind == "button":
+            parts.append(
+                '  <button class="w-full bg-blue-600 text-white px-4 py-2 mb-4 rounded">'
+                f'{html_lib.escape(label_for(comp, "Button"))}</button>'
+            )
+
+        elif kind == "navbar":
+            parts.append(
+                '  <nav class="bg-blue-600 text-white p-4 mb-5">'
+                f'{html_lib.escape(label_for(comp, "Navbar"))}</nav>'
+            )
+
+        elif kind == "card":
+            parts.append(
+                '  <div class="border rounded p-6 mb-4">'
+                f'{html_lib.escape(label_for(comp, "Card"))}</div>'
+            )
+
+    parts.append("</div>")
+
+    return "\n".join(parts)
+
+
+def render_react(components):
+
+    body = []
+
+    for comp in components:
+
+        kind = comp["type"]
+        text = html_lib.escape(label_for(comp, ""))
+
+        if kind == "text":
+            body.append(f'      <p className="mb-3">{text}</p>')
+
+        elif kind in ("email", "password", "input"):
+            field = "text" if kind == "input" else kind
+            placeholder = html_lib.escape(
+                label_for(comp, field.capitalize())
+            )
+            body.append(
+                f'      <input type="{field}" className="w-full border p-2 mb-4" '
+                f'placeholder="{placeholder}" />'
+            )
+
+        elif kind == "button":
+            body.append(
+                '      <button className="w-full bg-blue-600 text-white px-4 py-2 mb-4 rounded">'
+                f'{html_lib.escape(label_for(comp, "Button"))}</button>'
+            )
+
+        elif kind == "navbar":
+            body.append(
+                '      <nav className="bg-blue-600 text-white p-4 mb-5">'
+                f'{html_lib.escape(label_for(comp, "Navbar"))}</nav>'
+            )
+
+        elif kind == "card":
+            body.append(
+                '      <div className="border rounded p-6 mb-4">'
+                f'{html_lib.escape(label_for(comp, "Card"))}</div>'
+            )
+
+    return (
+        "export default function Sketch() {\n"
+        "  return (\n"
+        '    <div className="max-w-md mx-auto p-6">\n'
+        + "\n".join(body)
+        + "\n    </div>\n"
+        "  );\n"
+        "}\n"
     )
 
-    # ==========================
-    # OCR DETECTION
-    # ==========================
+
+# ==========================
+# PIPELINE
+# ==========================
+
+def detect_words(gray, display_img):
 
     data = pytesseract.image_to_data(
         gray,
         output_type=pytesseract.Output.DICT
     )
 
-    components = []
-
-    print("\n===== OCR WORDS =====")
+    words = []
 
     for i in range(len(data["text"])):
 
@@ -103,75 +344,30 @@ def sketch_to_html(image):
         if not text:
             continue
 
-        x = data["left"][i]
-        y = data["top"][i]
-        w = data["width"][i]
-        h = data["height"][i]
+        word = {
+            "text": text,
+            "x": data["left"][i],
+            "y": data["top"][i],
+            "w": data["width"][i],
+            "h": data["height"][i],
+        }
 
-        print(
-            f"{text} -> x={x}, y={y}, w={w}, h={h}"
-        )
-
-        components.append(
-            {
-                "text": text,
-                "x": x,
-                "y": y,
-                "w": w,
-                "h": h
-            }
-        )
+        words.append(word)
 
         cv2.rectangle(
             display_img,
-            (x, y),
-            (x + w, y + h),
+            (word["x"], word["y"]),
+            (word["x"] + word["w"], word["y"] + word["h"]),
             (255, 0, 0),
             2
         )
 
-    components = sorted(
-        components,
-        key=lambda c: (c["y"], c["x"])
-    )
+    return words
 
-    full_text = " ".join(
-        [c["text"] for c in components]
-    )
 
-    print("\n===== OCR TEXT =====")
-    print(full_text)
+def detect_shapes(blurred, display_img):
 
-    # ==========================
-    # OCR CLASSIFICATION
-    # ==========================
-
-    ui_components = []
-
-    for comp in components:
-
-        component_type = classify_component(
-            comp["text"]
-        )
-
-        ui_components.append(
-            {
-                "type": component_type,
-                "text": comp["text"],
-                "x": comp["x"],
-                "y": comp["y"]
-            }
-        )
-
-    # ==========================
-    # SHAPE DETECTION
-    # ==========================
-
-    edges = cv2.Canny(
-        blurred,
-        50,
-        150
-    )
+    edges = cv2.Canny(blurred, 50, 150)
 
     contours, _ = cv2.findContours(
         edges,
@@ -180,64 +376,33 @@ def sketch_to_html(image):
     )
 
     boxes = []
+    shapes = []
 
     for contour in contours:
 
-        x, y, w, h = cv2.boundingRect(
-            contour
+        x, y, w, h = cv2.boundingRect(contour)
+
+        if w * h <= MIN_SHAPE_AREA or w <= 10 or h <= 10:
+            continue
+
+        if is_duplicate((x, y, w, h), boxes):
+            continue
+
+        boxes.append((x, y, w, h))
+
+        shapes.append(
+            {
+                "type": classify_shape(w, h),
+                "x": x,
+                "y": y,
+                "w": w,
+                "h": h,
+            }
         )
-
-        area = w * h
-
-        if (
-            area > 500
-            and w > 10
-            and h > 10
-        ):
-
-            candidate = (
-                x,
-                y,
-                w,
-                h
-            )
-
-            if not is_duplicate(
-                candidate,
-                boxes
-            ):
-
-                boxes.append(candidate)
-
-                shape_type = classify_shape(
-                    w,
-                    h
-                )
-
-                ui_components.append(
-                    {
-                        "type": shape_type,
-                        "x": x,
-                        "y": y,
-                        "w": w,
-                        "h": h
-                    }
-                )
-
-    sorted_boxes = sorted(
-        boxes,
-        key=lambda b: (b[1], b[0])
-    )
-
-    print("\n===== BOXES =====")
 
     for i, (x, y, w, h) in enumerate(
-        sorted_boxes
+        sorted(boxes, key=lambda b: (b[1], b[0]))
     ):
-
-        print(
-            f"Box {i}: {(x, y, w, h)}"
-        )
 
         cv2.rectangle(
             display_img,
@@ -257,242 +422,54 @@ def sketch_to_html(image):
             2
         )
 
-    # ==========================
-    # HTML GENERATION
-    # ==========================
+    return shapes
 
-    html_code = """
-<div style="
-max-width:400px;
-margin:auto;
-padding:20px;
-font-family:Arial;
-">
-"""
 
-    for comp in ui_components:
+def sketch_to_html(image):
 
-        if comp["type"] == "text":
+    if image is None:
+        return "", "", "", "<p>Upload a sketch to begin.</p>", None
 
-            html_code += f"""
-<p>{comp['text']}</p>
-"""
+    rgb, gray = to_rgb_and_gray(image)
 
-        elif comp["type"] == "email":
+    display_img = rgb.copy()
 
-            html_code += """
-<input
-type="email"
-placeholder="Email"
-style="
-width:100%;
-padding:12px;
-margin-bottom:15px;
-">
-"""
+    blurred = cv2.GaussianBlur(gray, (5, 5), 0)
 
-        elif comp["type"] == "password":
+    binary = cv2.threshold(
+        gray,
+        150,
+        255,
+        cv2.THRESH_BINARY
+    )[1]
 
-            html_code += """
-<input
-type="password"
-placeholder="Password"
-style="
-width:100%;
-padding:12px;
-margin-bottom:15px;
-">
-"""
+    words = detect_words(binary, display_img)
+    shapes = detect_shapes(blurred, display_img)
 
-        elif comp["type"] == "input":
+    components = sort_by_layout(
+        merge_text_into_shapes(words, shapes)
+    )
 
-            html_code += """
-<input
-type="text"
-placeholder="Input"
-style="
-width:100%;
-padding:12px;
-margin-bottom:15px;
-">
-"""
+    rendered = [c for c in components if c["type"] != "unknown"]
+    unclassified = len(components) - len(rendered)
 
-        elif comp["type"] == "button":
+    html_code = render_html(rendered)
+    react_code = render_react(rendered)
+    tailwind_code = render_tailwind(rendered)
 
-            html_code += f"""
-<button
-style="
-width:100%;
-padding:12px;
-margin-bottom:15px;
-">
-{comp.get('text', 'Button')}
-</button>
-"""
-
-        elif comp["type"] == "navbar":
-
-            html_code += """
-<nav style="
-background:#1976d2;
-color:white;
-padding:15px;
-margin-bottom:20px;
-">
-Navbar
-</nav>
-"""
-
-        elif comp["type"] == "card":
-
-            html_code += """
-<div style="
-border:1px solid #ccc;
-padding:20px;
-margin-bottom:15px;
-border-radius:8px;
-">
-Card Component
-</div>
-"""
-
-    html_code += "</div>"
-
-    # ==========================
-    # REACT
-    # ==========================
-
-    react_code = """
-export default function Website() {
-  return (
-    <div>
-      <nav className="bg-blue-600 text-white p-4 flex justify-between">
-        <span>Mobile Version</span>
-
-        <div className="space-x-4">
-          <a href="#">Home</a>
-          <a href="#">Features</a>
-          <a href="#">Contact</a>
-        </div>
-      </nav>
-
-      <section className="bg-gray-100 text-center p-12">
-        <h1 className="text-4xl font-bold">
-          Hero Banner
-        </h1>
-
-        <p className="mt-4">
-          Multiple Slide Images
-        </p>
-      </section>
-
-      <section className="p-10">
-        <h2 className="text-2xl font-bold">
-          About Us
-        </h2>
-
-        <div className="border rounded p-6 mt-4">
-          Company Image
-        </div>
-      </section>
-
-      <section className="p-10">
-        <h2 className="text-2xl font-bold">
-          Sponsors
-        </h2>
-
-        <div className="border rounded p-6 mt-4">
-          Sponsor Logos
-        </div>
-      </section>
-
-      <section className="p-10">
-        <h2 className="text-2xl font-bold">
-          Features
-        </h2>
-
-        <div className="border rounded p-6 mt-4">
-          Feature 1
-        </div>
-
-        <div className="border rounded p-6 mt-4">
-          Feature 2
-        </div>
-
-        <div className="border rounded p-6 mt-4">
-          Feature 3
-        </div>
-      </section>
-
-      <section className="p-10">
-        <h2 className="text-2xl font-bold">
-          Contact
-        </h2>
-
-        <input
-          className="border p-2 w-full mb-4"
-          placeholder="Phone"
-        />
-
-        <input
-          className="border p-2 w-full mb-4"
-          placeholder="Email"
-        />
-
-        <button
-          className="bg-blue-600 text-white px-4 py-2 rounded"
-        >
-          Submit
-        </button>
-      </section>
-
-      <footer className="bg-black text-white p-6">
-        Copyright | Sitemap | Contact Info
-      </footer>
-    </div>
-  );
-}
-"""
-
-    # ==========================
-    # TAILWIND
-    # ==========================
-
-    tailwind_code = """
-<div class="max-w-md mx-auto p-6">
-  <input
-    class="w-full border p-2 mb-4"
-    placeholder="Email"
-  />
-
-  <input
-    class="w-full border p-2 mb-4"
-    placeholder="Password"
-  />
-
-  <button
-    class="bg-blue-600 text-white px-4 py-2"
-  >
-    Login
-  </button>
-</div>
-"""
-
-    detected_image = Image.fromarray(
-        display_img
+    full_text = " ".join(
+        w["text"] for w in sort_by_layout(words)
     )
 
     summary_html = f"""
 <h2>SketchNet Analysis</h2>
-
-<p>
-<strong>Detected Components:</strong>
-{len(sorted_boxes)}
-</p>
-
+<p><strong>Shapes detected:</strong> {len(shapes)}</p>
+<p><strong>OCR words:</strong> {len(words)}</p>
+<p><strong>Components emitted:</strong> {len(rendered)}
+({unclassified} unclassified, not rendered)</p>
 <h3>OCR Text</h3>
-
-<pre>{full_text}</pre>
+<pre>{html_lib.escape(full_text)}</pre>
+<h3>Preview</h3>
 """
 
     return (
@@ -500,7 +477,7 @@ export default function Website() {
         react_code,
         tailwind_code,
         summary_html + html_code,
-        detected_image
+        Image.fromarray(display_img),
     )
 
 
@@ -508,26 +485,15 @@ demo = gr.Interface(
     fn=sketch_to_html,
     inputs=gr.Image(type="pil"),
     outputs=[
-        gr.Code(
-            language="html",
-            label="Generated HTML"
-        ),
-        gr.Code(
-            language="javascript",
-            label="Generated React"
-        ),
-        gr.Code(
-            language="html",
-            label="Tailwind Code"
-        ),
-        gr.HTML(
-            label="Preview"
-        ),
-        gr.Image(
-            label="Detected Components"
-        )
+        gr.Code(language="html", label="Generated HTML"),
+        gr.Code(language="javascript", label="Generated React"),
+        gr.Code(language="html", label="Tailwind Code"),
+        gr.HTML(label="Preview"),
+        gr.Image(label="Detected Components"),
     ],
-    title="SketchNet v1.0"
+    title="SketchNet v1.1",
 )
 
-demo.launch()
+
+if __name__ == "__main__":
+    demo.launch()
